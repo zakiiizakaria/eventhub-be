@@ -18,24 +18,24 @@ use Symfony\Component\HttpKernel\Exception\UnprocessableEntityHttpException;
 class EmailService
 {
     /**
-     * Create event_staff records for a batch of staff members, dispatch
-     * queued invitation emails, and return the payload summary.
+     * Invite a batch of staff members to an event.
      *
-     * - Generates a unique UUID invitation_token per staff member.
-     * - Skips staff members who are already enrolled in the event (idempotent).
-     * - Queues an EventInvitationMail for each newly enrolled staff member.
+     * Behaviour:
+     * - **New staff**: creates an event_staff record with a fresh UUID token, then queues the email.
+     * - **Already-enrolled staff**: re-uses their existing token and re-queues the email (resend).
+     * - Staff not belonging to the same organizer are silently ignored.
      *
      * @param  string        $eventId  UUID of the event.
-     * @param  array<string> $staffIds Array of staff UUIDs to invite.
+     * @param  array<string> $staffIds Array of staff UUIDs to invite / resend to.
      *
-     * @return Collection<int, array<string, mixed>> Payload summaries for the API response.
+     * @return array{invited: Collection, resent: Collection}
      *
      * @throws NotFoundHttpException            If the event does not exist.
      * @throws UnprocessableEntityHttpException If the event is inactive.
      */
-    public function sendBulkInvitation(string $eventId, array $staffIds): Collection
+    public function sendBulkInvitation(string $eventId, array $staffIds): array
     {
-        return DB::transaction(function () use ($eventId, $staffIds): Collection {
+        return DB::transaction(function () use ($eventId, $staffIds): array {
 
             // 1. Validate event exists and is active.
             /** @var Event|null $event */
@@ -55,51 +55,67 @@ class EmailService
                 ->get()
                 ->keyBy('id');
 
-            // 3. Determine already-enrolled staff to avoid duplicate records.
-            $alreadyEnrolled = EventStaff::where('event_id', $eventId)
+            // 3. Fetch already-enrolled records keyed by staff_id for O(1) lookup.
+            $enrolledRecords = EventStaff::where('event_id', $eventId)
                 ->whereIn('staff_id', $staffIds)
-                ->pluck('staff_id')
-                ->flip(); // O(1) lookup
+                ->get()
+                ->keyBy('staff_id');
 
             $frontendBase = rtrim(config('app.frontend_url', 'http://localhost:3000'), '/');
-            $payloads     = collect();
+            $newInvites   = collect();
+            $resent       = collect();
 
             foreach ($staffMembers as $staff) {
-                if ($alreadyEnrolled->has($staff->id)) {
-                    continue; // Already enrolled — skip silently.
+
+                if ($enrolledRecords->has($staff->id)) {
+                    // ── Resend path: reuse the existing token ──────────────────
+                    /** @var EventStaff $eventStaff */
+                    $eventStaff = $enrolledRecords->get($staff->id);
+                    $eventStaff->setRelation('event', $event);
+                    $eventStaff->setRelation('staff', $staff);
+
+                    Mail::to($staff->email)->queue(new EventInvitationMail($eventStaff));
+
+                    $resent->push([
+                        'staff_id'         => $staff->id,
+                        'staff_name'       => $staff->name,
+                        'staff_email'      => $staff->email,
+                        'invitation_token' => $eventStaff->invitation_token,
+                        'rsvp_url'         => "{$frontendBase}/rsvp/{$eventStaff->invitation_token}",
+                    ]);
+
+                } else {
+                    // ── New invite path: create record + fresh token ───────────
+                    $token = (string) Str::uuid();
+
+                    /** @var EventStaff $eventStaff */
+                    $eventStaff = EventStaff::create([
+                        'event_id'         => $eventId,
+                        'staff_id'         => $staff->id,
+                        'invitation_token' => $token,
+                        'is_attending'     => false,
+                        'pax'              => 1,
+                    ]);
+
+                    $eventStaff->setRelation('event', $event);
+                    $eventStaff->setRelation('staff', $staff);
+
+                    Mail::to($staff->email)->queue(new EventInvitationMail($eventStaff));
+
+                    $newInvites->push([
+                        'staff_id'         => $staff->id,
+                        'staff_name'       => $staff->name,
+                        'staff_email'      => $staff->email,
+                        'event_id'         => $event->id,
+                        'event_title'      => $event->title,
+                        'event_date'       => $event->event_date->toDateString(),
+                        'invitation_token' => $token,
+                        'rsvp_url'         => "{$frontendBase}/rsvp/{$token}",
+                    ]);
                 }
-
-                $token = (string) Str::uuid();
-
-                /** @var EventStaff $eventStaff */
-                $eventStaff = EventStaff::create([
-                    'event_id'         => $eventId,
-                    'staff_id'         => $staff->id,
-                    'invitation_token' => $token,
-                    'is_attending'     => false,
-                    'pax'              => 1,
-                ]);
-
-                // Set relationships in-memory so the Mailable doesn't re-query.
-                $eventStaff->setRelation('event', $event);
-                $eventStaff->setRelation('staff', $staff);
-
-                // Dispatch invitation email to the queue.
-                Mail::to($staff->email)->queue(new EventInvitationMail($eventStaff));
-
-                $payloads->push([
-                    'staff_id'         => $staff->id,
-                    'staff_name'       => $staff->name,
-                    'staff_email'      => $staff->email,
-                    'event_id'         => $event->id,
-                    'event_title'      => $event->title,
-                    'event_date'       => $event->event_date->toDateString(),
-                    'invitation_token' => $token,
-                    'rsvp_url'         => "{$frontendBase}/rsvp/{$token}",
-                ]);
             }
 
-            return $payloads;
+            return ['invited' => $newInvites, 'resent' => $resent];
         });
     }
 }

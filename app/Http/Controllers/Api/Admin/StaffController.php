@@ -54,18 +54,27 @@ class StaffController extends BaseController
     public function inviteToEvent(InviteStaffRequest $request): JsonResponse
     {
         try {
-            $payloads = $this->emailService->sendBulkInvitation(
+            ['invited' => $invited, 'resent' => $resent] = $this->emailService->sendBulkInvitation(
                 eventId : $request->validated('event_id'),
                 staffIds: $request->validated('staff_ids'),
             );
 
-            // TODO: Dispatch a queued Mailable for each payload here.
-            // Mail::to($payload['staff_email'])->queue(new EventInvitationMail($payload));
+            $total   = $invited->count() + $resent->count();
+            $message = match (true) {
+                $invited->isNotEmpty() && $resent->isNotEmpty() => "{$invited->count()} invitation(s) sent and {$resent->count()} resent successfully.",
+                $invited->isNotEmpty()                          => "{$invited->count()} invitation(s) sent successfully.",
+                $resent->isNotEmpty()                           => "{$resent->count()} invitation(s) resent successfully.",
+                default                                         => 'No emails were sent. All selected staff may not belong to this organizer.',
+            };
 
-            return $this->success(
-                ['invited_count' => $payloads->count(), 'invitations' => $payloads],
-                "{$payloads->count()} invitation(s) prepared successfully.",
-            );
+            return $this->success([
+                'invited_count' => $invited->count(),
+                'resent_count'  => $resent->count(),
+                'total_count'   => $total,
+                'invited'       => $invited,
+                'resent'        => $resent,
+            ], $message);
+
         } catch (NotFoundHttpException $e) {
             return $this->error($e->getMessage(), 404);
         } catch (UnprocessableEntityHttpException $e) {
