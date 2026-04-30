@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace App\Services\Shared;
 
+use App\Mail\EventInvitationMail;
 use App\Models\Event;
 use App\Models\EventStaff;
 use App\Models\Staff;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\HttpKernel\Exception\UnprocessableEntityHttpException;
@@ -16,17 +18,17 @@ use Symfony\Component\HttpKernel\Exception\UnprocessableEntityHttpException;
 class EmailService
 {
     /**
-     * Create event_staff records for a batch of staff members and prepare
-     * the invitation payload for email blasting.
+     * Create event_staff records for a batch of staff members, dispatch
+     * queued invitation emails, and return the payload summary.
      *
      * - Generates a unique UUID invitation_token per staff member.
      * - Skips staff members who are already enrolled in the event (idempotent).
-     * - Returns a collection of arrays ready to pass to a Mailable / queue job.
+     * - Queues an EventInvitationMail for each newly enrolled staff member.
      *
      * @param  string        $eventId  UUID of the event.
      * @param  array<string> $staffIds Array of staff UUIDs to invite.
      *
-     * @return Collection<int, array<string, mixed>> Prepared invitation payloads.
+     * @return Collection<int, array<string, mixed>> Payload summaries for the API response.
      *
      * @throws NotFoundHttpException            If the event does not exist.
      * @throws UnprocessableEntityHttpException If the event is inactive.
@@ -37,7 +39,7 @@ class EmailService
 
             // 1. Validate event exists and is active.
             /** @var Event|null $event */
-            $event = Event::find($eventId);
+            $event = Event::with('organizer')->find($eventId);
 
             if (! $event) {
                 throw new NotFoundHttpException('Event not found.');
@@ -47,29 +49,30 @@ class EmailService
                 throw new UnprocessableEntityHttpException('Cannot send invitations for an inactive event.');
             }
 
-            // 2. Fetch only the staff that belong to the same organizer.
+            // 2. Fetch only staff that belong to the same organizer.
             $staffMembers = Staff::whereIn('id', $staffIds)
                 ->where('organizer_id', $event->organizer_id)
                 ->get()
                 ->keyBy('id');
 
-            // 3. Find staff IDs already enrolled to avoid duplicates.
+            // 3. Determine already-enrolled staff to avoid duplicate records.
             $alreadyEnrolled = EventStaff::where('event_id', $eventId)
                 ->whereIn('staff_id', $staffIds)
                 ->pluck('staff_id')
                 ->flip(); // O(1) lookup
 
-            $payloads = collect();
+            $frontendBase = rtrim(config('app.frontend_url', 'http://localhost:3000'), '/');
+            $payloads     = collect();
 
             foreach ($staffMembers as $staff) {
-                // Skip if already enrolled — this makes the method idempotent.
                 if ($alreadyEnrolled->has($staff->id)) {
-                    continue;
+                    continue; // Already enrolled — skip silently.
                 }
 
                 $token = (string) Str::uuid();
 
-                EventStaff::create([
+                /** @var EventStaff $eventStaff */
+                $eventStaff = EventStaff::create([
                     'event_id'         => $eventId,
                     'staff_id'         => $staff->id,
                     'invitation_token' => $token,
@@ -77,7 +80,13 @@ class EmailService
                     'pax'              => 1,
                 ]);
 
-                // Build the payload the email job/Mailable will consume.
+                // Set relationships in-memory so the Mailable doesn't re-query.
+                $eventStaff->setRelation('event', $event);
+                $eventStaff->setRelation('staff', $staff);
+
+                // Dispatch invitation email to the queue.
+                Mail::to($staff->email)->queue(new EventInvitationMail($eventStaff));
+
                 $payloads->push([
                     'staff_id'         => $staff->id,
                     'staff_name'       => $staff->name,
@@ -86,8 +95,7 @@ class EmailService
                     'event_title'      => $event->title,
                     'event_date'       => $event->event_date->toDateString(),
                     'invitation_token' => $token,
-                    // TODO: replace with actual RSVP URL helper once routes are defined.
-                    'rsvp_url'         => url("/rsvp/{$token}"),
+                    'rsvp_url'         => "{$frontendBase}/rsvp/{$token}",
                 ]);
             }
 
